@@ -4,21 +4,9 @@ import AppLayout from '../components/AppLayout.jsx';
 import Button from '../components/Button.jsx';
 import Icon from '../components/Icon.jsx';
 import SelectField from '../components/SelectField.jsx';
-import { useAuth } from '../context/AuthContext.jsx';
 import { useCaseDraft } from '../context/CaseDraftContext.jsx';
-import {
-  buildCasePayload,
-  buildClinicalContentPayload,
-  buildPatientPayload,
-  validateDraftForApi,
-} from '../services/caseMappers.js';
 import { questionTypeOptions } from '../services/caseMock.js';
-import {
-  createCase,
-  createClinicalContent,
-  createPatient,
-  getCompleteCase,
-} from '../services/pibicApi.js';
+import { buildLocalCaseFromDraft, saveLocalCase } from '../services/localCases.js';
 
 const defaultAlternatives = [
   'Iniciar Ácido Acetilsalicílico, monitorar e solicitar troponina.',
@@ -27,6 +15,9 @@ const defaultAlternatives = [
   'Prescrever analgesia simples e reavaliar em consulta eletiva.',
 ];
 
+const emptyAlternatives = ['', '', '', ''];
+const defaultStatement = 'Qual o diagnóstico mais provável e a conduta imediata para este paciente na sala de emergência?';
+const defaultFeedback = 'A prioridade é reconhecer risco cardiovascular, monitorar o paciente e iniciar a investigação imediata.';
 const defaultTrueFalseItems = [
   { statement: 'A dor torácica com irradiação exige investigação imediata.', answer: 'Verdadeiro' },
   { statement: 'A ausência de febre exclui uma condição cardiovascular grave.', answer: 'Falso' },
@@ -41,13 +32,16 @@ const classOptions = [
 function createEmptyQuestion(id) {
   return {
     id,
-    statement: 'Qual o diagnóstico mais provável e a conduta imediata para este paciente na sala de emergência?',
+    statement: '',
     type: 'Múltipla escolha',
-    alternatives: defaultAlternatives,
-    trueFalseItems: defaultTrueFalseItems,
+    alternatives: emptyAlternatives,
+    trueFalseItems: [
+      { statement: '', answer: 'Verdadeiro' },
+      { statement: '', answer: 'Falso' },
+    ],
     correctAlternative: 1,
-    answer: defaultAlternatives[1],
-    feedback: 'A prioridade é reconhecer risco cardiovascular, monitorar o paciente e iniciar a investigação imediata.',
+    answer: '',
+    feedback: '',
   };
 }
 
@@ -61,8 +55,17 @@ function isTrueFalseQuestion(type) {
 
 function normalizeQuestion(question, index) {
   const fallback = createEmptyQuestion(index + 1);
-  const alternatives = question.alternatives?.length >= 2 ? question.alternatives : defaultAlternatives;
-  const trueFalseItems = question.trueFalseItems?.length >= 1 ? question.trueFalseItems : defaultTrueFalseItems;
+  const alternatives = question.alternatives?.length >= 2
+    ? question.alternatives.map((alternative) => (
+      defaultAlternatives.includes(alternative) ? '' : alternative
+    ))
+    : emptyAlternatives;
+  const trueFalseItems = question.trueFalseItems?.length >= 1
+    ? question.trueFalseItems.map((item) => ({
+      ...item,
+      statement: defaultTrueFalseItems.some((defaultItem) => defaultItem.statement === item.statement) ? '' : item.statement,
+    }))
+    : fallback.trueFalseItems;
   const type = question.type ?? fallback.type;
   const correctAlternative = Number.isInteger(question.correctAlternative) && question.correctAlternative < alternatives.length
     ? question.correctAlternative
@@ -72,10 +75,10 @@ function normalizeQuestion(question, index) {
     ...fallback,
     ...question,
     type,
-    statement: question.statement ?? fallback.statement,
+    statement: question.statement === defaultStatement ? '' : question.statement ?? fallback.statement,
     alternatives,
     trueFalseItems,
-    feedback: question.feedback ?? fallback.feedback,
+    feedback: question.feedback === defaultFeedback ? '' : question.feedback ?? fallback.feedback,
     correctAlternative,
     answer: isDiscursiveQuestion(type) ? question.answer ?? fallback.answer : alternatives[correctAlternative],
   };
@@ -90,7 +93,6 @@ export default function CreateCaseQuestions() {
   const [allowResolutionHints, setAllowResolutionHints] = useState(true);
   const [answerTimeLimit, setAnswerTimeLimit] = useState('60min');
   const [deliveryDeadline, setDeliveryDeadline] = useState('');
-  const { auth } = useAuth();
   const { draft, resetDraft, setSavedCase, updateDraftSection } = useCaseDraft();
   const navigate = useNavigate();
   const questions = (draft.questions?.items?.length ? draft.questions.items : [createEmptyQuestion(1)])
@@ -111,10 +113,6 @@ export default function CreateCaseQuestions() {
         }
 
         const nextQuestion = { ...question, [field]: value };
-
-        if (field === 'type' && isDiscursiveQuestion(value) && !nextQuestion.answer?.trim()) {
-          nextQuestion.answer = 'O aluno deve justificar a hipótese clínica e indicar a conduta inicial com base nos dados apresentados.';
-        }
 
         return nextQuestion;
       }),
@@ -161,7 +159,7 @@ export default function CreateCaseQuestions() {
 
         return {
           ...question,
-          alternatives: [...question.alternatives, 'Nova alternativa'],
+          alternatives: [...question.alternatives, ''],
         };
       }),
     );
@@ -220,7 +218,7 @@ export default function CreateCaseQuestions() {
           ...question,
           trueFalseItems: [
             ...question.trueFalseItems,
-            { statement: 'Nova afirmação', answer: 'Verdadeiro' },
+            { statement: '', answer: 'Verdadeiro' },
           ],
         };
       }),
@@ -261,41 +259,50 @@ export default function CreateCaseQuestions() {
   };
 
   const handleGenerateCase = async () => {
-    const validationMessage = validateDraftForApi(draft, auth);
-
-    if (validationMessage) {
-      setFeedback(validationMessage);
-      return;
-    }
-
     setFeedback('');
     setIsGenerating(true);
 
-    try {
-      const caseResponse = await createCase(buildCasePayload(draft, auth));
-      const idCaso = caseResponse.idCaso;
-      const [patientResponse, clinicalContentResponse] = await Promise.all([
-        createPatient(buildPatientPayload(draft, idCaso)),
-        createClinicalContent(buildClinicalContentPayload(draft, idCaso)),
-      ]);
-      const completeResponse = await getCompleteCase(idCaso);
+    const publishedCase = buildLocalCaseFromDraft(draft, questions, {
+      mode: publishMode,
+      selectedClasses,
+      allowResolutionHints,
+      answerTimeLimit,
+      deliveryDeadline,
+    });
 
-      setSavedCase({
-        case: caseResponse,
-        patient: patientResponse,
-        clinicalContent: clinicalContentResponse,
-        complete: completeResponse,
-        questions,
-        savedAt: new Date().toISOString(),
-      });
-      resetDraft();
-
-      navigate('/criar-caso/revisao');
-    } catch (requestError) {
-      setFeedback(requestError.message || 'Não foi possível salvar o caso na API.');
-    } finally {
-      setIsGenerating(false);
-    }
+    saveLocalCase(publishedCase);
+    setSavedCase({
+      case: {
+        titulo: publishedCase.title,
+        especialidade: publishedCase.specialty,
+        disciplina: publishedCase.discipline,
+        areaSaude: publishedCase.healthArea,
+        dificuldade: publishedCase.difficulty,
+        status: publishedCase.status,
+        objetivoAprendizagem: draft.clinical.pedagogicalGoal,
+      },
+      patient: {
+        nome: draft.patient.name,
+        idade: draft.patient.age,
+        profissao: draft.patient.profession,
+        sexo: draft.patient.biologicalSex,
+        estadoCivil: draft.patient.maritalStatus,
+        peso: draft.patient.weight,
+        altura: draft.patient.height,
+      },
+      clinicalContent: {
+        sintomas: draft.clinical.symptoms,
+        contexto: draft.clinical.clinicalContext,
+        examClinico: draft.clinical.clinicalExam,
+        antecClinico: draft.clinical.comorbidities,
+        diagEsperado: draft.clinical.centralHypothesis,
+      },
+      questions,
+      savedAt: publishedCase.createdAt,
+    });
+    resetDraft();
+    setIsGenerating(false);
+    navigate('/meus-casos');
   };
 
   const handlePublishClick = () => {
@@ -380,6 +387,7 @@ export default function CreateCaseQuestions() {
                     name={`question-statement-${question.id}`}
                     onChange={handleQuestionChange(question.id, 'statement')}
                     onInput={handleQuestionChange(question.id, 'statement')}
+                    placeholder="Digite o enunciado da questão"
                     value={question.statement}
                   />
                 </label>
@@ -392,6 +400,7 @@ export default function CreateCaseQuestions() {
                         name={`question-answer-${question.id}`}
                         onChange={handleQuestionChange(question.id, 'answer')}
                         onInput={handleQuestionChange(question.id, 'answer')}
+                        placeholder="Digite a resposta esperada"
                         value={question.answer}
                       />
                     </label>
@@ -401,6 +410,7 @@ export default function CreateCaseQuestions() {
                         name={`question-feedback-${question.id}`}
                         onChange={handleQuestionChange(question.id, 'feedback')}
                         onInput={handleQuestionChange(question.id, 'feedback')}
+                        placeholder="Digite os critérios de correção"
                         value={question.feedback}
                       />
                     </label>
@@ -425,6 +435,7 @@ export default function CreateCaseQuestions() {
                           aria-label={`Afirmação ${String.fromCharCode(65 + index)}`}
                           onChange={handleTrueFalseItemChange(question.id, index, 'statement')}
                           onInput={handleTrueFalseItemChange(question.id, index, 'statement')}
+                          placeholder={`Digite a afirmação ${String.fromCharCode(65 + index)}`}
                           value={item.statement}
                         />
                         <div className="true-false-toggle" aria-label={`Classificação da afirmação ${String.fromCharCode(65 + index)}`}>
@@ -457,6 +468,7 @@ export default function CreateCaseQuestions() {
                         name={`question-feedback-${question.id}`}
                         onChange={handleQuestionChange(question.id, 'feedback')}
                         onInput={handleQuestionChange(question.id, 'feedback')}
+                        placeholder="Digite uma justificativa para o aluno"
                         value={question.feedback}
                       />
                     </label>
@@ -489,6 +501,7 @@ export default function CreateCaseQuestions() {
                           aria-label={`Alternativa ${String.fromCharCode(65 + index)}`}
                           onChange={handleAlternativeChange(question.id, index)}
                           onInput={handleAlternativeChange(question.id, index)}
+                          placeholder={`Digite a alternativa ${String.fromCharCode(65 + index)}`}
                           value={alternative}
                         />
                         <button
